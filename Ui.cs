@@ -98,9 +98,13 @@ internal static class Ui
         try
         {
             // Ağ olayları arka planda çalışır. Kontrolleri formun iş parçacığı günceller.
-            form.BeginInvoke(action);
+            form.BeginInvoke(() =>
+            {
+                if (!form.IsDisposed && !form.Disposing)
+                    action();
+            });
         }
-        catch (InvalidOperationException) when (!form.IsHandleCreated || form.IsDisposed || form.Disposing)
+        catch (InvalidOperationException)
         {
             // Olay gönderilirken pencere kapanmış olabilir.
         }

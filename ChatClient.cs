@@ -10,18 +10,20 @@ internal sealed class ChatClient
     private readonly SemaphoreSlim _sendLock = new(1);
     private volatile ChatConnection? _connection;
     private Task? _receiveTask;
+    private int _connectionVersion;
 
     public bool IsConnected => _connection is { IsClosed: false };
+    public int ConnectionVersion => Volatile.Read(ref _connectionVersion);
 
-    public event Action<ChatMessage, bool>? MessageReceived;
-    public event Action<string>? NoticeReceived;
-    public event Action<string?>? ConnectionClosed;
+    public event Action<int, ChatMessage, bool>? MessageReceived;
+    public event Action<int, string>? NoticeReceived;
+    public event Action<int, string?>? ConnectionClosed;
 
     public async Task ConnectAsync(
         string userName, IPAddress address, int port, CancellationToken cancellationToken = default)
     {
         ChatProtocol.ValidatePort(port);
-        userName = userName.Trim();
+        userName = userName.Trim(' ');
         if (!ChatProtocol.IsValidText(userName, ChatProtocol.MaxUserNameLength))
             throw new ArgumentException("Kullanıcı adı 1–24 karakter olmalıdır ve kontrol karakteri içeremez.");
 
@@ -31,12 +33,14 @@ internal sealed class ChatClient
             if (IsConnected)
                 throw new InvalidOperationException("Sunucuya zaten bağlısınız.");
 
+            // Kuyrukta kalan olaylar yeni bağlantı girişiminin arayüzünü değiştirmemeli.
+            int version = Interlocked.Increment(ref _connectionVersion);
             await DisconnectCoreAsync().ConfigureAwait(false);
             ChatConnection connection = await OpenConnectionAsync(userName, address, port, cancellationToken)
                 .ConfigureAwait(false);
 
             _connection = connection;
-            _receiveTask = ReceiveAsync(connection, userName);
+            _receiveTask = ReceiveAsync(connection, userName, version);
         }
         finally
         {
@@ -49,6 +53,7 @@ internal sealed class ChatClient
     {
         var tcpClient = new TcpClient(address.AddressFamily);
         ChatConnection? connection = null;
+        bool accepted = false;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(5));
 
@@ -61,26 +66,41 @@ internal sealed class ChatClient
 
             string? response = await connection.ReadLineAsync(timeout.Token).ConfigureAwait(false);
             if (response == ChatProtocol.Accepted)
+            {
+                accepted = true;
                 return connection;
+            }
 
             string errorPrefix = ChatProtocol.Error + "\t";
             if (response?.StartsWith(errorPrefix, StringComparison.Ordinal) == true)
-                throw new IOException(response[errorPrefix.Length..]);
+            {
+                string error = response[errorPrefix.Length..];
+                if (ChatProtocol.IsValidText(error, ChatProtocol.MaxMessageLength))
+                    throw new IOException(error);
+            }
 
             throw new IOException("Sunucu bağlantı isteğine geçerli bir yanıt vermedi.");
         }
-        catch
+        catch (OperationCanceledException exception) when (!cancellationToken.IsCancellationRequested)
         {
-            // Bağlantı onaylanmadan oluşan hatalarda da soket kapatılır.
-            connection?.Dispose();
-            tcpClient.Dispose();
-            throw;
+            throw new TimeoutException("Bağlantı isteği zaman aşımına uğradı.", exception);
+        }
+        finally
+        {
+            if (!accepted)
+            {
+                // Bağlantı onaylanmadan oluşan hatalarda da soket kapatılır.
+                if (connection is null)
+                    tcpClient.Dispose();
+                else
+                    connection.Dispose();
+            }
         }
     }
 
     public async Task SendAsync(string message)
     {
-        message = message.Trim();
+        message = message.Trim(' ');
         if (!ChatProtocol.IsValidText(message, ChatProtocol.MaxMessageLength))
             throw new ArgumentException("Mesaj 1–500 karakter olmalıdır ve kontrol karakteri içeremez.");
 
@@ -91,7 +111,9 @@ internal sealed class ChatClient
             if (connection is not { IsClosed: false })
                 throw new InvalidOperationException("Mesaj göndermek için sunucuya bağlanın.");
 
-            await connection.WriteLineAsync($"{ChatProtocol.Send}\t{message}").ConfigureAwait(false);
+            // Sunucu, yavaş alıcıyı kendi 3 saniyelik yazma sınırıyla önce kapatabilmeli.
+            await connection.WriteLineAsync($"{ChatProtocol.Send}\t{message}", timeoutSeconds: 6)
+                .ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is IOException or SocketException or ObjectDisposedException)
         {
@@ -119,15 +141,23 @@ internal sealed class ChatClient
 
     private async Task DisconnectCoreAsync()
     {
-        _connection?.Close();
-        if (_receiveTask is not null)
-            await _receiveTask.ConfigureAwait(false);
-
+        ChatConnection? connection = _connection;
+        Task? receiveTask = _receiveTask;
         _connection = null;
         _receiveTask = null;
+
+        try
+        {
+            connection?.Close();
+        }
+        finally
+        {
+            if (receiveTask is not null)
+                await receiveTask.ConfigureAwait(false);
+        }
     }
 
-    private async Task ReceiveAsync(ChatConnection connection, string userName)
+    private async Task ReceiveAsync(ChatConnection connection, string userName, int version)
     {
         string reason = "Sunucu bağlantıyı kapattı.";
         try
@@ -138,7 +168,7 @@ internal sealed class ChatClient
                 if (line is null)
                     break;
 
-                HandleLine(line, userName);
+                HandleLine(line, userName, version);
             }
         }
         catch (InvalidDataException)
@@ -165,11 +195,11 @@ internal sealed class ChatClient
                 _sendLock.Release();
             }
 
-            ConnectionClosed?.Invoke(closedLocally ? null : reason);
+            ConnectionClosed?.Invoke(version, closedLocally ? null : reason);
         }
     }
 
-    private void HandleLine(string line, string userName)
+    private void HandleLine(string line, string userName, int version)
     {
         string[] parts = line.Split('\t', 4);
         if (parts.Length == 4 && parts[0] == ChatProtocol.Message &&
@@ -180,19 +210,22 @@ internal sealed class ChatClient
         {
             var message = new ChatMessage(parts[2], parts[3], sentAt);
             bool isOwnMessage = string.Equals(parts[2], userName, StringComparison.OrdinalIgnoreCase);
-            MessageReceived?.Invoke(message, isOwnMessage);
+            MessageReceived?.Invoke(version, message, isOwnMessage);
         }
         else if (parts.Length == 2)
         {
             string? notice = parts[0] switch
             {
-                ChatProtocol.Joined => $"{parts[1]} sohbete katıldı.",
-                ChatProtocol.Left => $"{parts[1]} sohbetten ayrıldı.",
-                ChatProtocol.Error => parts[1],
+                ChatProtocol.Joined when ChatProtocol.IsValidText(parts[1], ChatProtocol.MaxUserNameLength)
+                    => $"{parts[1]} sohbete katıldı.",
+                ChatProtocol.Left when ChatProtocol.IsValidText(parts[1], ChatProtocol.MaxUserNameLength)
+                    => $"{parts[1]} sohbetten ayrıldı.",
+                ChatProtocol.Error when ChatProtocol.IsValidText(parts[1], ChatProtocol.MaxMessageLength)
+                    => parts[1],
                 _ => null
             };
             if (notice is not null)
-                NoticeReceived?.Invoke(notice);
+                NoticeReceived?.Invoke(version, notice);
         }
     }
 }

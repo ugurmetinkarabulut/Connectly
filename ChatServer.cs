@@ -14,9 +14,7 @@ internal sealed class ChatServer
 
     public event Action<string>? Activity;
     public event Action<string[]>? UsersChanged;
-    public event Action? Stopped;
-
-    public void Start(int port)
+    public Task Start(int port)
     {
         ChatProtocol.ValidatePort(port);
 
@@ -40,6 +38,7 @@ internal sealed class ChatServer
             var stopSignal = new CancellationTokenSource();
             _stopSignal = stopSignal;
             _serverTask = Task.Run(() => ListenAsync(listener, port, stopSignal));
+            return _serverTask;
         }
     }
 
@@ -56,10 +55,9 @@ internal sealed class ChatServer
     {
         CancellationToken cancellationToken = stopSignal.Token;
         var clientTasks = new List<Task>();
-        Activity?.Invoke($"Sunucu 127.0.0.1:{port} adresinde dinliyor.");
-
         try
         {
+            Activity?.Invoke($"Sunucu 127.0.0.1:{port} adresinde dinliyor.");
             while (!cancellationToken.IsCancellationRequested)
             {
                 TcpClient client = await listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
@@ -77,18 +75,27 @@ internal sealed class ChatServer
         }
         finally
         {
-            stopSignal.Cancel();
-            listener.Stop();
-            await Task.WhenAll(clientTasks).ConfigureAwait(false);
-
-            lock (_lifecycleLock)
+            try
             {
-                _stopSignal = null;
-                stopSignal.Dispose();
+                try
+                {
+                    stopSignal.Cancel();
+                }
+                finally
+                {
+                    listener.Stop();
+                    await Task.WhenAll(clientTasks).ConfigureAwait(false);
+                }
             }
-
-            Activity?.Invoke("Sunucu durdu.");
-            Stopped?.Invoke();
+            finally
+            {
+                // Bir istemci görevi hata verse de iptal kaynağı serbest bırakılır.
+                lock (_lifecycleLock)
+                {
+                    _stopSignal = null;
+                    stopSignal.Dispose();
+                }
+            }
         }
     }
 
@@ -115,7 +122,7 @@ internal sealed class ChatServer
 
                     string prefix = ChatProtocol.Hello + "\t";
                     string userName = hello.StartsWith(prefix, StringComparison.Ordinal)
-                        ? hello[prefix.Length..].Trim()
+                        ? hello[prefix.Length..].Trim(' ')
                         : "";
                     if (!ChatProtocol.IsValidText(userName, ChatProtocol.MaxUserNameLength))
                     {
@@ -137,11 +144,12 @@ internal sealed class ChatServer
                         }
 
                         await connection.WriteLineAsync(ChatProtocol.Accepted, cancellationToken).ConfigureAwait(false);
-                        await BroadcastAsync($"{ChatProtocol.Joined}\t{userName}", cancellationToken).ConfigureAwait(false);
                         _users.Add(userName, connection);
                         joinedName = userName;
                         ReportUsers();
                         Activity?.Invoke($"{userName} bağlandı.");
+                        await BroadcastAsync($"{ChatProtocol.Joined}\t{userName}", cancellationToken, connection)
+                            .ConfigureAwait(false);
                     }
                     finally
                     {
@@ -183,11 +191,14 @@ internal sealed class ChatServer
         string userName, ChatConnection connection, string line, CancellationToken cancellationToken)
     {
         string prefix = ChatProtocol.Send + "\t";
-        string message = line.StartsWith(prefix, StringComparison.Ordinal) ? line[prefix.Length..].Trim() : "";
+        string message = line.StartsWith(prefix, StringComparison.Ordinal) ? line[prefix.Length..].Trim(' ') : "";
 
         await _broadcastLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (connection.IsClosed)
+                return;
+
             if (!ChatProtocol.IsValidText(message, ChatProtocol.MaxMessageLength))
             {
                 await WriteToUserAsync(
@@ -228,8 +239,9 @@ internal sealed class ChatServer
     }
 
     // Kayıt, yayın ve ayrılma aynı kilitten geçer. Bir akışa iki yayın aynı anda yazamaz.
-    private Task BroadcastAsync(string line, CancellationToken cancellationToken) =>
-        Task.WhenAll(_users.Values.Select(user => WriteToUserAsync(user, line, cancellationToken)));
+    private Task BroadcastAsync(string line, CancellationToken cancellationToken, ChatConnection? excluded = null) =>
+        Task.WhenAll(_users.Values.Where(user => user != excluded)
+            .Select(user => WriteToUserAsync(user, line, cancellationToken)));
 
     private static async Task WriteToUserAsync(
         ChatConnection user, string line, CancellationToken cancellationToken)

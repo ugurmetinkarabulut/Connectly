@@ -25,5 +25,5 @@ internal static class ChatProtocol
 
     // Kontrol karakterleri satır sonunu veya alan ayırıcısını taklit edebilir.
     public static bool IsValidText(string value, int maxLength) =>
-        value.Length >= 1 && value.Length <= maxLength && !value.Any(char.IsControl);
+        value.Length <= maxLength && !string.IsNullOrWhiteSpace(value) && !value.Any(char.IsControl);
 }

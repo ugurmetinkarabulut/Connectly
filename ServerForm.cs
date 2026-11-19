@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Sockets;
 
 namespace Connectly;
@@ -14,6 +15,7 @@ internal sealed class ServerForm : Form
     private readonly ListBox _activity = CreateList("Bağlantı ve mesaj olayları");
     private bool _closing;
     private bool _cleanupComplete;
+    private int _runVersion;
 
     public ServerForm()
     {
@@ -21,19 +23,26 @@ internal sealed class ServerForm : Form
         Controls.Add(BuildLayout());
         SetRunning(false);
 
-        _start.Click += (_, _) => StartServer();
-        _stop.Click += async (_, _) => await StopServerAsync();
+        _start.Click += async (_, _) => await StartServerAsync();
+        _stop.Click += (_, _) => RequestStop();
         _server.Activity += entry =>
         {
             string time = DateTime.Now.ToString("HH:mm:ss");
-            Ui.Post(this, () => AddActivity(time, entry));
+            Ui.Post(this, () =>
+            {
+                if (!_closing)
+                    AddActivity(time, entry);
+            });
         };
-        _server.UsersChanged += names => Ui.Post(this, () => ShowUsers(names));
-        _server.Stopped += () => Ui.Post(this, () =>
+        _server.UsersChanged += names =>
         {
-            if (!_closing)
-                SetRunning(false);
-        });
+            int version = Volatile.Read(ref _runVersion);
+            Ui.Post(this, () =>
+            {
+                if (!_closing && version == _runVersion)
+                    ShowUsers(names);
+            });
+        };
     }
 
     private TableLayoutPanel BuildLayout()
@@ -110,7 +119,7 @@ internal sealed class ServerForm : Form
         BorderStyle = BorderStyle.None
     };
 
-    private void StartServer()
+    private async Task StartServerAsync()
     {
         if (!Ui.TryReadPort(_port, out int port))
         {
@@ -119,32 +128,70 @@ internal sealed class ServerForm : Form
             return;
         }
 
+        Task serverTask;
         try
         {
-            _server.Start(port);
-            SetRunning(true);
+            Interlocked.Increment(ref _runVersion);
+            serverTask = _server.Start(port);
         }
         catch (SocketException exception) when (exception.SocketErrorCode == SocketError.AddressAlreadyInUse)
         {
             SetStatus($"{port} numaralı port kullanımda. Başka bir port seçin.", Ui.LightRed);
+            return;
         }
         catch (SocketException exception)
         {
             SetStatus($"Sunucu bu portu açamadı ({exception.SocketErrorCode}).", Ui.LightRed);
+            return;
         }
-        catch (InvalidOperationException exception)
+        catch (Exception exception)
         {
-            SetStatus(exception.Message, Ui.LightRed);
+            Debug.WriteLine(exception);
+            SetStatus("Sunucu başlatılamadı.", Ui.LightRed);
+            return;
+        }
+
+        SetRunning(true);
+        string? error = null;
+        try
+        {
+            // Başlat düğmesi ancak dinleme ve bağlantı temizliği bitince açılır.
+            await serverTask;
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine(exception);
+            error = "Sunucu durdu. Bir bağlantı hatayla kapandı.";
+        }
+        finally
+        {
+            Interlocked.Increment(ref _runVersion);
+            if (!_closing)
+            {
+                SetRunning(false);
+                ShowUsers([]);
+                AddActivity(DateTime.Now.ToString("HH:mm:ss"), error ?? "Sunucu durdu.");
+                if (error is not null)
+                    SetStatus(error, Ui.LightRed);
+            }
         }
     }
 
-    private async Task StopServerAsync()
+    private void RequestStop()
     {
         _stop.Enabled = false;
         SetStatus("●  Bağlantılar kapatılıyor…", Ui.Muted);
-        await _server.StopAsync();
-        if (!_closing)
-            SetRunning(false);
+        try
+        {
+            // StartServerAsync aynı görevi zaten bekliyor ve sonucu ekrana yazıyor.
+            _ = _server.StopAsync();
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine(exception);
+            _stop.Enabled = true;
+            SetStatus("Sunucuya durdurma isteği gönderilemedi.", Ui.LightRed);
+        }
     }
 
     private void SetRunning(bool running)
@@ -191,8 +238,18 @@ internal sealed class ServerForm : Form
 
         _closing = true;
         Enabled = false;
-        await _server.StopAsync();
-        _cleanupComplete = true;
-        BeginInvoke((Action)Close);
+        try
+        {
+            await _server.StopAsync();
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine(exception);
+        }
+        finally
+        {
+            _cleanupComplete = true;
+            Ui.Post(this, Close);
+        }
     }
 }

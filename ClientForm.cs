@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 
@@ -51,13 +52,12 @@ internal sealed class ClientForm : Form
             }
         };
 
-        _client.MessageReceived += (message, isOwn) => Ui.Post(this, () => ShowMessage(message, isOwn));
-        _client.NoticeReceived += notice => Ui.Post(this, () => AddNotice(notice));
-        _client.ConnectionClosed += reason => Ui.Post(this, () =>
+        _client.MessageReceived += (version, message, isOwn) =>
+            PostConnectionEvent(version, () => ShowMessage(message, isOwn));
+        _client.NoticeReceived += (version, notice) =>
+            PostConnectionEvent(version, () => AddNotice(notice));
+        _client.ConnectionClosed += (version, reason) => PostConnectionEvent(version, () =>
         {
-            if (_closing)
-                return;
-
             if (reason is not null)
             {
                 AddNotice(reason);
@@ -69,6 +69,15 @@ internal sealed class ClientForm : Form
 
         ActiveControl = _userName;
         UpdateControls();
+    }
+
+    private void PostConnectionEvent(int version, Action action)
+    {
+        Ui.Post(this, () =>
+        {
+            if (!_closing && version == _client.ConnectionVersion)
+                action();
+        });
     }
 
     private TableLayoutPanel BuildLayout()
@@ -145,7 +154,7 @@ internal sealed class ClientForm : Form
 
     private async Task ConnectAsync()
     {
-        string userName = _userName.Text.Trim();
+        string userName = _userName.Text.Trim(' ');
         if (!ChatProtocol.IsValidText(userName, ChatProtocol.MaxUserNameLength))
         {
             SetStatus("Geçerli bir kullanıcı adı girin (1–24 karakter).", Ui.LightRed);
@@ -182,10 +191,13 @@ internal sealed class ClientForm : Form
                 AddNotice($"{userName} olarak bağlandınız.");
             }
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
-            if (!_closing)
-                SetStatus("Bağlantı isteği zaman aşımına uğradı.", Ui.LightRed);
+            // Form kapanırken bekleyen bağlantı iptal edilir.
+        }
+        catch (TimeoutException exception)
+        {
+            SetStatus(exception.Message, Ui.LightRed);
         }
         catch (SocketException)
         {
@@ -198,6 +210,11 @@ internal sealed class ClientForm : Form
         catch (InvalidDataException)
         {
             SetStatus("Sunucudan geçersiz yanıt alındı.", Ui.LightRed);
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine(exception);
+            SetStatus("Bağlantı kurulamadı. Tekrar deneyin.", Ui.LightRed);
         }
         finally
         {
@@ -213,15 +230,23 @@ internal sealed class ClientForm : Form
     {
         _changingConnection = true;
         UpdateControls();
-        await _client.DisconnectAsync();
-
-        if (!_closing)
+        try
         {
+            await _client.DisconnectAsync();
             SetStatus("●  Bağlı değil", Ui.Muted);
-            AddNotice("Bağlantıyı kestiniz.");
+            if (!_closing)
+                AddNotice("Bağlantıyı kestiniz.");
         }
-        _changingConnection = false;
-        UpdateControls();
+        catch (Exception exception)
+        {
+            Debug.WriteLine(exception);
+            SetStatus("Bağlantı kapatılırken bir hata oluştu.", Ui.LightRed);
+        }
+        finally
+        {
+            _changingConnection = false;
+            UpdateControls();
+        }
     }
 
     private async Task SendAsync()
@@ -235,7 +260,7 @@ internal sealed class ClientForm : Form
         try
         {
             await _client.SendAsync(originalText);
-            if (_message.Text == originalText)
+            if (!_closing && _message.Text == originalText)
                 _message.Clear();
         }
         catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or IOException)
@@ -243,9 +268,14 @@ internal sealed class ClientForm : Form
             if (!_closing)
             {
                 AddNotice(exception.Message);
-                if (!_client.IsConnected)
+                if (!_client.IsConnected && !_changingConnection)
                     SetStatus("●  Bağlı değil", Ui.LightRed);
             }
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine(exception);
+            SetStatus("Mesaj gönderilemedi.", Ui.LightRed);
         }
         finally
         {
@@ -256,15 +286,22 @@ internal sealed class ClientForm : Form
 
     private void UpdateControls()
     {
+        if (_closing)
+            return;
+
         bool connected = _client.IsConnected;
-        bool canConnect = !_closing && !_changingConnection && !connected;
+        bool canConnect = !_changingConnection && !_sending && !connected;
         _userName.Enabled = _address.Enabled = _port.Enabled = _connect.Enabled = canConnect;
-        _disconnect.Enabled = _message.Enabled = !_closing && !_changingConnection && connected;
-        _send.Enabled = _message.Enabled && !_sending && !string.IsNullOrWhiteSpace(_message.Text);
+        _disconnect.Enabled = _message.Enabled = !_changingConnection && connected;
+        _send.Enabled = _message.Enabled && !_sending &&
+            ChatProtocol.IsValidText(_message.Text.Trim(' '), ChatProtocol.MaxMessageLength);
     }
 
     private void SetStatus(string text, Color color)
     {
+        if (_closing)
+            return;
+
         _status.Text = text;
         _status.ForeColor = color;
     }
@@ -299,9 +336,25 @@ internal sealed class ClientForm : Form
 
         _closing = true;
         Enabled = false;
-        _connectCancellation?.Cancel();
-        await _client.DisconnectAsync();
-        _cleanupComplete = true;
-        BeginInvoke((Action)Close);
+        try
+        {
+            try
+            {
+                _connectCancellation?.Cancel();
+            }
+            finally
+            {
+                await _client.DisconnectAsync();
+            }
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine(exception);
+        }
+        finally
+        {
+            _cleanupComplete = true;
+            Ui.Post(this, Close);
+        }
     }
 }

@@ -26,6 +26,7 @@ internal sealed class ChatConnection : IDisposable
 
     public async Task<string?> ReadLineAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var line = new StringBuilder();
 
         while (true)
@@ -41,7 +42,12 @@ internal sealed class ChatConnection : IDisposable
 
             char character = _readBuffer[_readPosition++];
             if (character == '\n')
-                return line.ToString().TrimEnd('\r');
+            {
+                if (line.Length > 0 && line[line.Length - 1] == '\r')
+                    line.Length--;
+
+                return line.ToString();
+            }
 
             if (line.Length == ChatProtocol.MaxLineLength)
                 throw new InvalidDataException("Ağdan gelen satır izin verilen uzunluğu aştı.");
@@ -50,11 +56,12 @@ internal sealed class ChatConnection : IDisposable
         }
     }
 
-    public async Task WriteLineAsync(string line, CancellationToken cancellationToken = default)
+    public async Task WriteLineAsync(
+        string line, CancellationToken cancellationToken = default, int timeoutSeconds = 3)
     {
         // Yavaş bir istemci, sunucunun diğer bağlantıları süresiz bekletmemeli.
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(3));
+        timeout.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
         try
         {
