@@ -1,0 +1,16 @@
+# .NET ve Visual Studio
+bin/
+obj/
+.vs/
+*.user
+*.userosscache
+*.rsuser
+*.suo
+*.sln.docstates
+*.pubxml.user
+
+# İşletim sistemine ve yerel ortama ait dosyalar
+.DS_Store
+Thumbs.db
+.env
+.env.*
