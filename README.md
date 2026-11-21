@@ -8,8 +8,8 @@ Fırat Üniversitesi Yazılım Mühendisliği 2. sınıf **YMH219 Nesne Tabanlı
 
 | Öğrenci bilgisi | Değer |
 | --- | --- |
-| Adı ve soyadı | … |
-| Öğrenci numarası | … |
+| Adı ve soyadı | Uğur Metin Karabulut |
+| Öğrenci numarası | 250541103 |
 
 ## Teknolojiler
 
